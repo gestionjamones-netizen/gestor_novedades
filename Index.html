@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <base target="_top">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+  <?!= include('Stylesheet'); ?>
+</head>
+
+<body>
+
+  <div class="top-bar">
+    <div class="logo-area">
+      <div class="logo">
+        <i class="material-icons">event_note</i> Gestión de novedades
+      </div>
+      <div class="search-box">
+        <i class="material-icons">search</i>
+        <input type="text" id="inpSearch" class="filter-input" style="width:200px; text-align:left; padding-left:10px;" placeholder="Buscar global..." onkeyup="updateFilter('global', this.value)">
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="control-group">
+        <label>TURNO</label>
+        <div class="select-wrapper">
+          <select id="selTurno" class="custom-select" onchange="loadData()"></select>
+          <span class="select-arrow">▼</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>AÑO</label>
+        <div class="select-wrapper">
+          <select id="selAnio" class="custom-select" onchange="loadData()"></select>
+          <span class="select-arrow">▼</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>MES DE GESTIÓN</label>
+        <div class="select-wrapper">
+          <button onclick="changeMonth(-1)" class="custom-select" style="padding: 6px;">❮</button>
+          <select id="selMes" class="custom-select" onchange="loadData()"></select>
+          <button onclick="changeMonth(1)" class="custom-select" style="padding: 6px;">❯</button>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>REPORTE</label>
+        <button class="btn-load" onclick="requestReport()" title="Generar Archivo Plano TXT" style="background:var(--accent-green)">
+    <i class="material-icons">save_alt</i>
+  </button>
+      </div>
+
+      <div class="control-group">
+        <label>&nbsp;</label>
+        <button class="btn-load" onclick="loadData()" title="Recargar">
+            <i class="material-icons">refresh</i>
+            </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <div class="table-wrapper">
+    <div id="loader" class="loader-overlay hidden">
+      <div class="spinner"></div>
+    </div>
+
+    <table id="mainTable">
+      <thead></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div id="modal" class="modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 style="margin:0; font-size:1rem;">GESTIONAR NOVEDADES</h3>
+        <span style="cursor:pointer; font-size:1.4rem" onclick="closeModal()">&times;</span>
+      </div>
+
+      <div class="modal-body">
+        <div class="info-row"
+          style="background:#f0f4f8; padding:10px; border-radius:6px; margin-bottom:15px; display:flex; justify-content:space-between;">
+          <div><small>Colaborador</small><br><b id="txtNombre">---</b></div>
+          <div style="text-align:right"><small>Fecha</small><br><b id="txtFecha">---</b></div>
+        </div>
+
+        <form id="frmNovedad">
+          <input type="hidden" id="hdnRegistro">
+          <input type="hidden" id="hdnFecha">
+          <input type="hidden" id="hdnId">
+          <input type="hidden" id="hdnBatchId">
+
+          <div id="secAtajos"
+            style="background:#fff8e1; padding:8px; border-radius:4px; margin-bottom:10px; border:1px dashed #ffc107;">
+            <label style="display:block;margin-bottom:5px;font-weight:bold;font-size:0.8rem;color:#d35400">⚡ Atajos</label>
+            <select id="selAtajo" class="full-width" onchange="applyAtajo()" style="margin-bottom:0">
+                    <option value=""> Selección Manual </option>
+                </select>
+            <div id="atajoSummary" style="font-size:0.75rem; color:#666; margin-top:5px; display:none;"></div>
+          </div>
+
+          <label style="display:block;margin-bottom:5px;font-weight:600;font-size:0.8rem">1. Tipo</label>
+          <div class="type-selector">
+            <div class="type-option" id="btnTypeNomina" onclick="selectType('NOMINA')">
+              <i class="material-icons" style="font-size:1rem;vertical-align:middle">attach_money</i> Nómina
+            </div>
+            <div class="type-option" id="btnTypeOtro" onclick="selectType('OTRO')">
+              <i class="material-icons" style="font-size:1rem;vertical-align:middle">beach_access</i> Otros
+            </div>
+          </div>
+          <input type="hidden" id="hdnTipoSeleccionado">
+
+          <div id="step2" class="hidden">
+            <label style="display:block;margin-bottom:5px;font-weight:600;font-size:0.8rem">2. Detalles</label>
+            <select id="selConcepto" class="full-width"></select>
+
+            <div style="display:flex; gap:10px;">
+              <div style="flex:1">
+                <label id="lblValor" style="display:block;margin-bottom:5px;font-weight:600;font-size:0.8rem">Valor</label>
+                <input type="text" id="inpValor" class="full-width" placeholder="Valor">
+              </div>
+              <div style="flex:2">
+                <label style="display:block;margin-bottom:5px;font-weight:600;font-size:0.8rem">Notas (Opcional)</label>
+                <input type="text" id="inpObs" class="full-width" placeholder="...">
+              </div>
+            </div>
+
+            <div id="secMassUsers" class="hidden" style="margin-top:10px; border-top:1px solid #eee; padding-top:10px;">
+              <label style="display:block;margin-bottom:5px;font-weight:600;font-size:0.8rem">Aplicar a (Reporte Masivo)</label>
+              <div class="mass-controls">
+                <div class="mass-check-all">
+                  <input type="checkbox" id="chkMassAll" onchange="toggleMassAll()">
+                  <small>Todos</small>
+                </div>
+                <input type="text" id="inpMassFilter" class="mass-filter" placeholder="Buscar empleado..." onkeyup="filterMassList()">
+              </div>
+              <div id="lstMassUsers" class="user-select-list"></div>
+            </div>
+          </div>
+        </form>
+
+        <div id="secExistingEvents" class="event-list-container hidden">
+          <div class="event-list-title">Novedades registradas este día</div>
+          <div id="lstExistingEvents">
+          </div>
+        </div>
+
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" id="btnDeleteAll" class="btn-danger hidden" onclick="confirmDeleteAll()">LIMPIAR DÍA</button>
+        <button type="button" id="btnDelete" class="btn-danger hidden" onclick="confirmDelete()">ELIMINAR</button>
+        <button type="button" id="btnCancelEdit" class="btn-cancel hidden" onclick="resetModalForm()">CANCELAR EDICIÓN</button>
+        <button type="button" id="btnSave" class="btn-save" onclick="saveData()">GUARDAR</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modalReport" class="modal">
+    <div class="modal-box" style="max-width: 380px;">
+      <div class="modal-header" style="background: var(--accent-green);">
+        <h3 style="margin:0; font-size:1rem;">GENERAR REPORTE NÓMINA</h3>
+        <span style="cursor:pointer; font-size:1.4rem" onclick="closeReportModal()">&times;</span>
+      </div>
+
+      <div class="modal-body">
+        <div id="viewRepInput">
+          <p style="font-size:0.85rem; color:#666; margin-top:0;">
+            Se generarán las novedades tipo <b>NÓMINA</b> para el turno y año seleccionados actualmente.
+          </p>
+
+          <div style="margin-bottom:15px;">
+            <label style="display:block; font-weight:600; font-size:0.8rem; margin-bottom:5px;">Semana de Gestión</label>
+            <input type="number" id="inpRepSemana" class="full-width" placeholder="Ej: 42" style="font-size:1rem; padding:8px;">
+          </div>
+
+          <div style="margin-bottom:10px;">
+            <label style="display:block; font-weight:600; font-size:0.8rem; margin-bottom:5px;">Fecha de Liquidación</label>
+            <input type="date" id="inpRepFecha" class="full-width" style="font-size:1rem; padding:8px; font-family:inherit;">
+            <small style="color:#888; font-size:0.7rem;">Fecha que aparecerá en el encabezado del archivo plano.</small>
+          </div>
+        </div>
+
+        <div id="viewRepSuccess" class="hidden" style="text-align:center; padding: 10px 0;">
+          <div style="color:var(--accent-green); margin-bottom:10px;">
+            <i class="material-icons" style="font-size: 3rem;">check_circle</i>
+          </div>
+          <h4 style="margin:5px 0; color:#333;">¡Reporte Generado!</h4>
+          <p style="font-size:0.85rem; color:#555; margin-bottom:20px;" id="txtRepFilename">nombre_archivo.txt</p>
+
+          <a id="btnRepDownload" href="#" target="_blank" class="btn-save"
+            style="display:flex; align-items:center; justify-content:center; gap:10px; text-decoration:none; background:var(--secondary-blue);">
+            <i class="material-icons">cloud_download</i> ABRIR ARCHIVO
+          </a>
+        </div>
+      </div>
+
+      <div class="modal-footer" id="footerRep">
+        <button type="button" class="btn-cancel" onclick="closeReportModal()">CANCELAR</button>
+        <button type="button" class="btn-save" style="background:var(--accent-green);" onclick="generateReportAction()">GENERAR</button>
+      </div>
+
+      <div class="modal-footer hidden" id="footerRepClose">
+        <button type="button" class="btn-cancel" style="width:100%" onclick="closeReportModal()">CERRAR VENTANA</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastContainer" class="toast-container"></div>
+
+  <?!= include('JavaScript'); ?>
+</body>
+
+</html>

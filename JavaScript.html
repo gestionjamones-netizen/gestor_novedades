@@ -1,0 +1,1090 @@
+<script>
+  let state = {
+    personal: [],
+    filteredPersonal: [],
+    novedades: [],
+    conceptos: [],
+    atajos: [],
+    groupedAtajos: {},
+    balancesPermisos: {}, 
+    balancesComp: {},     
+    mes: new Date().getMonth(),
+    anio: new Date().getFullYear(),
+    turno: "",
+    holidays: [], 
+    filters: { global: "", contrato: "", registro: "", nombre: "", puesto: "" },
+    currentModalEvents: [],
+    config: { puestoOrder: [], colors: {} }
+  };
+  
+  // Variables para el sistema de Buffer
+  let syncQueue = [];
+  let isSyncing = false;
+  let syncTimer = null;
+  let syncToastElement = null; 
+
+  const MONTHS = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+
+  window.onload = function() {
+    initControls();
+    loadTurnos();
+    document.getElementById('selConcepto').addEventListener('change', updateInputTypeDisplay);
+    
+    document.addEventListener('keydown', (e) => {
+        if (document.getElementById('modal').style.display === 'block') {
+            if (e.key === 'Escape') closeModal();
+            if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') saveData();
+        }
+    });
+
+    syncTimer = setInterval(processSyncQueue, 2000);
+  };
+
+  function runGoogleScript(funcName, ...args) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(reject)
+        [funcName](...args);
+    });
+  }
+
+  function initControls() {
+    const selMes = document.getElementById('selMes');
+    MONTHS.forEach((m, i) => {
+      let opt = document.createElement('option');
+      opt.value = i; opt.text = m;
+      if(i === state.mes) opt.selected = true;
+      selMes.appendChild(opt);
+    });
+    const selAnio = document.getElementById('selAnio');
+    for(let y=2023; y<=2030; y++) {
+      let opt = document.createElement('option');
+      opt.value = y; opt.text = y;
+      if(y === state.anio) opt.selected = true;
+      selAnio.appendChild(opt);
+    }
+  }
+
+  async function loadTurnos() {
+    try {
+        const list = await runGoogleScript('getTurnosList');
+        const sel = document.getElementById('selTurno');
+        list.forEach(t => {
+            let opt = document.createElement('option');
+            opt.value = t; opt.text = t;
+            sel.appendChild(opt);
+        });
+        if(list.length > 0) loadData();
+    } catch (e) { handleError(e); }
+  }
+
+  function changeMonth(delta) {
+    let m = parseInt(document.getElementById('selMes').value);
+    let y = parseInt(document.getElementById('selAnio').value);
+    m += delta;
+    if(m > 11) { m = 0; y++; }
+    if(m < 0) { m = 11; y--; }
+    document.getElementById('selMes').value = m;
+    document.getElementById('selAnio').value = y;
+    loadData();
+  }
+
+  async function loadData() {
+    showLoader(true);
+    state.turno = document.getElementById('selTurno').value;
+    state.mes = parseInt(document.getElementById('selMes').value);
+    state.anio = parseInt(document.getElementById('selAnio').value);
+    
+    try {
+        const res = await runGoogleScript('getInitialData', state.turno, state.mes, state.anio);
+        processResponse(res);
+    } catch (e) { handleError(e); }
+  }
+
+  // Versión silenciosa para mantener fluidez tras optimismo
+  async function loadData2() {
+    // No mostramos loader visual, pero internamente sabemos que estamos actualizando
+    state.turno = document.getElementById('selTurno').value;
+    state.mes = parseInt(document.getElementById('selMes').value);
+    state.anio = parseInt(document.getElementById('selAnio').value);
+    
+    try {
+        const res = await runGoogleScript('getInitialData', state.turno, state.mes, state.anio);
+        // Procesamos la respuesta igual, esto actualizará los IDs temporales por reales
+        processResponse(res);
+    } catch (e) { 
+        console.error("Error en carga silenciosa", e);
+        // Si falla la carga silenciosa, no interrumpimos al usuario agresivamente
+        updateSyncStatus("error", "Error de conexión en fondo");
+    }
+  }
+
+  function processResponse(res) {
+    showLoader(false);
+    if (!res.success) { handleError(res.error); return; }
+    
+    state.personal = res.data.personal;
+    state.novedades = res.data.novedades;
+    state.conceptos = res.data.conceptos;
+    state.atajos = res.data.atajos || [];
+    state.balancesPermisos = res.data.balancesPermisos || {};
+    state.balancesComp = res.data.balancesComp || {}; 
+    state.holidays = res.data.holidays || [];
+    state.config = res.data.config || { puestoOrder: [], colors: {} };
+    
+    processAtajosUI();
+
+    const puestos = state.config.puestoOrder;
+    state.personal.sort((a, b) => {
+      let idxA = puestos.indexOf(a.puesto);
+      let idxB = puestos.indexOf(b.puesto);
+      if (idxA === -1) idxA = 999;
+      if (idxB === -1) idxB = 999;
+      if (idxA !== idxB) return idxA - idxB;
+      if (a.puesto !== b.puesto) return a.puesto.localeCompare(b.puesto);
+      return a.nombre.localeCompare(b.nombre);
+    });
+
+    renderHeader();
+    applyFilters(); 
+  }
+
+  function processAtajosUI() {
+    state.groupedAtajos = {};
+    const sel = document.getElementById('selAtajo');
+    sel.innerHTML = '<option value="">-- Selección Manual --</option>';
+    
+    state.atajos.forEach(a => {
+        if(!state.groupedAtajos[a.nombre]) {
+            state.groupedAtajos[a.nombre] = [];
+            let opt = document.createElement('option');
+            opt.value = a.nombre;
+            opt.text = a.nombre;
+            sel.appendChild(opt);
+        }
+        state.groupedAtajos[a.nombre].push(a);
+    });
+  }
+
+  function applyAtajo() {
+    const name = document.getElementById('selAtajo').value;
+    const summary = document.getElementById('atajoSummary');
+    const btnNom = document.getElementById('btnTypeNomina');
+    const btnOtr = document.getElementById('btnTypeOtro');
+    
+    const step2 = document.getElementById('step2');
+    const selConcepto = document.getElementById('selConcepto');
+    const lblDetalles = selConcepto.previousElementSibling; 
+    const divInputs = selConcepto.nextElementSibling; 
+    
+    const isMassMode = document.getElementById('hdnRegistro').value === "MASIVO";
+
+    if(!name) {
+        summary.style.display = 'none';
+        btnNom.style.pointerEvents = 'auto'; btnNom.style.opacity = '1';
+        btnOtr.style.pointerEvents = 'auto'; btnOtr.style.opacity = '1';
+
+        if(lblDetalles) lblDetalles.style.display = '';
+        selConcepto.style.display = '';
+        if(divInputs) divInputs.style.display = '';
+
+        step2.classList.add('hidden');
+        if(document.getElementById('hdnTipoSeleccionado').value) {
+             step2.classList.remove('hidden');
+        }
+        return;
+    }
+
+    const items = state.groupedAtajos[name];
+    summary.style.display = 'block';
+    summary.innerHTML = "Se agregarán: " + items.map(i => `<b>${i.concepto}</b> (${i.valor})`).join(', ');
+
+    btnNom.style.pointerEvents = 'none'; btnNom.style.opacity = '0.5';
+    btnOtr.style.pointerEvents = 'none'; btnOtr.style.opacity = '0.5';
+
+    if (isMassMode) {
+        step2.classList.remove('hidden');
+        if(lblDetalles) lblDetalles.style.display = 'none';
+        selConcepto.style.display = 'none';
+        if(divInputs) divInputs.style.display = 'none';
+        document.getElementById('secMassUsers').classList.remove('hidden');
+    } else {
+        step2.classList.add('hidden');
+    }
+  }
+
+  function resetModalForm() {
+    document.getElementById('frmNovedad').reset();
+    
+    const selConcepto = document.getElementById('selConcepto');
+    const lblDetalles = selConcepto.previousElementSibling; 
+    const divInputs = selConcepto.nextElementSibling; 
+    if(lblDetalles) lblDetalles.style.display = '';
+    selConcepto.style.display = '';
+    if(divInputs) divInputs.style.display = '';
+    
+    document.getElementById('selAtajo').value = ""; 
+    applyAtajo(); 
+
+    document.getElementById('hdnId').value = "";
+    document.getElementById('hdnBatchId').value = "";
+    document.getElementById('step2').classList.add('hidden');
+    document.getElementById('btnTypeNomina').className = 'type-option';
+    document.getElementById('btnTypeOtro').className = 'type-option';
+    
+    document.getElementById('btnDelete').classList.add('hidden');
+    document.getElementById('btnDeleteAll').classList.add('hidden');
+    document.getElementById('btnSave').innerText = "GUARDAR";
+    document.getElementById('btnCancelEdit').classList.add('hidden');
+    document.querySelectorAll('.event-card').forEach(el => el.classList.remove('is-editing'));
+    
+    const secAtajos = document.getElementById('secAtajos');
+    if(secAtajos) secAtajos.classList.remove('hidden');
+
+    document.getElementById('btnTypeNomina').style.pointerEvents = 'auto'; document.getElementById('btnTypeNomina').style.opacity = '1';
+    document.getElementById('btnTypeOtro').style.pointerEvents = 'auto'; document.getElementById('btnTypeOtro').style.opacity = '1';
+  }
+
+  function updateFilter(type, val) {
+    state.filters[type] = val.toLowerCase();
+    applyFilters();
+  }
+
+  function applyFilters() {
+    const { global: fGlobal, contrato: fCont, registro: fReg, nombre: fNom, puesto: fPue } = state.filters;
+    if (!fGlobal && !fCont && !fReg && !fNom && !fPue) {
+      state.filteredPersonal = state.personal;
+    } else {
+      state.filteredPersonal = state.personal.filter(p => {
+        const sCont = p.contrato.toLowerCase(), sReg = p.registro.toLowerCase();
+        const sNom = p.nombre.toLowerCase(), sPue = p.puesto.toLowerCase();
+        let matchGlobal = true;
+        if (fGlobal) matchGlobal = sCont.includes(fGlobal) || sReg.includes(fGlobal) || sNom.includes(fGlobal) || sPue.includes(fGlobal);
+        return matchGlobal && (!fCont || sCont.includes(fCont)) && (!fReg || sReg.includes(fReg)) && (!fNom || sNom.includes(fNom)) && (!fPue || sPue.includes(fPue));
+      });
+    }
+    renderBody(); 
+  }
+
+  function isSundayOrHoliday(dateObj) {
+    let dateStr = `${dateObj.getFullYear()}-${String(dateObj.getMonth()+1).padStart(2,'0')}-${String(dateObj.getDate()).padStart(2,'0')}`;
+    return dateObj.getDay() === 0 || state.holidays.includes(dateStr);
+  }
+
+  function getColorForConcept(conc) {
+    if (!conc) return "#95a5a6"; 
+    const c = String(conc).toLowerCase(); 
+
+    if (state.config.colors && state.config.colors[c]) return state.config.colors[c];
+    if (c.includes("incapacidad")) return "#9b59b6";
+    if (c.includes("calamidad")) return "#34495e";
+    if (c.includes("vacaciones")) return "#7f8c8d";
+    if (c.includes("permiso")) return "#2ecc71";
+
+    let hash = 0;
+    for (let i = 0; i < c.length; i++) {
+        hash = c.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return `hsl(${Math.abs(hash % 360)}, 60%, 45%)`;
+  }
+
+  function getWeekNumber(d) {
+    d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+    var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+    var weekNo = Math.ceil(( ( (d - yearStart) / 86400000) + 1)/7);
+    return weekNo;
+  }
+
+  function renderHeader() {
+    const thead = document.querySelector('#mainTable thead');
+    thead.innerHTML = ""; 
+    const daysInMonth = new Date(state.anio, state.mes + 1, 0).getDate();
+
+    const cols = [
+      {id:'contrato', t:"Contrato", cls:"col-contrato pos-1"},
+      {id:'registro', t:"Reg.", cls:"col-registro pos-2"},
+      {id:'nombre',   t:"Nombre Colaborador", cls:"col-nombre pos-3"},
+      {id:'puesto',   t:"Puesto", cls:"col-puesto pos-4"},
+    ];
+
+    let trWeeks = document.createElement('tr');
+    trWeeks.classList.add('tr-weeks');
+    let thInfoSpace = document.createElement('th');
+    thInfoSpace.colSpan = 4;
+    thInfoSpace.classList.add('sticky-col'); 
+    thInfoSpace.style.background = "#fff";
+    thInfoSpace.style.zIndex = "40"; 
+    trWeeks.appendChild(thInfoSpace);
+
+    let currentWeekNum = -1;
+    let spanCount = 0;
+    
+    for(let d=1; d<=daysInMonth; d++) {
+        let date = new Date(state.anio, state.mes, d);
+        let w = getWeekNumber(date);
+        
+        if (currentWeekNum === -1) currentWeekNum = w;
+
+        if (w !== currentWeekNum) {
+            let thW = document.createElement('th');
+            thW.colSpan = spanCount;
+            thW.textContent = "Semana " + currentWeekNum;
+            thW.className = "week-header";
+            trWeeks.appendChild(thW);
+            currentWeekNum = w;
+            spanCount = 1;
+        } else {
+            spanCount++;
+        }
+    }
+    if (spanCount > 0) {
+        let thW = document.createElement('th');
+        thW.colSpan = spanCount;
+        thW.textContent = "Semana " + currentWeekNum;
+        thW.className = "week-header";
+        trWeeks.appendChild(thW);
+    }
+    
+    let thSumSpace = document.createElement('th');
+    thSumSpace.colSpan = 3; 
+    thSumSpace.className = "week-header-empty";
+    trWeeks.appendChild(thSumSpace);
+    thead.appendChild(trWeeks);
+
+    let trTitle = document.createElement('tr');
+    cols.forEach(c => {
+      let th = document.createElement('th');
+      th.className = `sticky-col ${c.cls}`; th.textContent = c.t; 
+      th.style.top = "25px"; 
+      trTitle.appendChild(th);
+    });
+
+    for(let d=1; d<=daysInMonth; d++) {
+      let th = document.createElement('th');
+      let date = new Date(state.anio, state.mes, d);
+      let dayName = ["D","L","M","X","J","V","S"][date.getDay()];
+      if(isSundayOrHoliday(date)) th.className = "is-holiday-header";
+      th.className += " day-header";
+      th.innerHTML = `${d}<br><small>${dayName}</small>`;
+      let fechaStr = `${state.anio}-${String(state.mes+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      th.onclick = () => openMassModal(fechaStr);
+      trTitle.appendChild(th);
+    }
+
+    const addSumCol = (html, cls) => {
+        let th = document.createElement('th');
+        th.innerHTML = html; th.className = cls; 
+        th.style.top = "25px";
+        trTitle.appendChild(th);
+    };
+    addSumCol("Dom/<br>Fes", "col-summary");
+    addSumCol("Saldo<br>Permiso", "col-balance");
+    addSumCol("Saldo<br>Comp.", "col-comp");
+
+    thead.appendChild(trTitle);
+
+    let trFilter = document.createElement('tr');
+    cols.forEach(c => {
+      let th = document.createElement('th');
+      th.className = `sticky-col ${c.cls}`;
+      th.style.top = "73px"; 
+      let input = document.createElement('input');
+      input.type = "text"; input.className = "filter-input"; input.placeholder = "Filtrar...";
+      input.value = state.filters[c.id]; input.onkeyup = (e) => updateFilter(c.id, e.target.value);
+      th.appendChild(input); trFilter.appendChild(th);
+    });
+    
+    let thEmpty = document.createElement('th');
+    thEmpty.colSpan = daysInMonth + 3;
+    thEmpty.style.background = "#f8f9fa";
+    thEmpty.style.position = "sticky";
+    thEmpty.style.top = "73px";
+    trFilter.appendChild(thEmpty);
+    thead.appendChild(trFilter);
+  }
+
+function detectAtajoMatch(events) {
+      if (!state.groupedAtajos || Object.keys(state.groupedAtajos).length === 0) return null;
+      if (!events || events.length === 0) return null;
+
+      for (const [atajoName, definitions] of Object.entries(state.groupedAtajos)) {
+          // 1. Si la cantidad de items no coincide, descartamos inmediatamente
+          if (definitions.length !== events.length) continue;
+
+          // 2. Creamos una copia de los eventos del día para ir "tachando" los encontrados
+          // y evitar que un mismo evento cuente para dos definiciones
+          let remainingEvents = [...events];
+          
+          let isFullMatch = true;
+
+          for (const def of definitions) {
+              const defConcept = String(def.concepto).toLowerCase().trim();
+              const defValRaw = String(def.valor).trim().toUpperCase();
+
+              let foundIndex = -1;
+
+              // --- NUEVA LÓGICA DE AGRUPACIÓN ---
+              if (defValRaw === "X") {
+                  // CASO COMODÍN "X":
+                  // Buscamos cualquier evento que tenga el MISMO CONCEPTO, sin importar el valor.
+                  foundIndex = remainingEvents.findIndex(e => 
+                      String(e.concepto).toLowerCase().trim() === defConcept
+                  );
+              } else {
+                  // CASO ESTÁNDAR:
+                  // Buscamos coincidencia exacta de CONCEPTO Y VALOR.
+                  const defValFloat = parseFloat(defValRaw.replace(',', '.'));
+
+                  foundIndex = remainingEvents.findIndex(e => {
+                      const evtConcept = String(e.concepto).toLowerCase().trim();
+                      const evtValFloat = parseFloat(String(e.valor).replace(',', '.'));
+                      
+                      // Usamos toFixed(4) para evitar errores de precisión en punto flotante
+                      return evtConcept === defConcept && 
+                             evtValFloat.toFixed(4) === defValFloat.toFixed(4);
+                  });
+              }
+
+              // Si no encontramos un evento que satisfaga esta definición del atajo, rompemos el ciclo
+              if (foundIndex === -1) {
+                  isFullMatch = false;
+                  break;
+              }
+
+              // Si hubo match, eliminamos ese evento de la lista temporal para no reutilizarlo
+              remainingEvents.splice(foundIndex, 1);
+          }
+
+          // Si logramos emparejar todas las definiciones con los eventos disponibles
+          if (isFullMatch) return atajoName;
+      }
+      return null;
+  }
+
+  function renderBody() {
+    const tbody = document.querySelector('#mainTable tbody');
+    tbody.innerHTML = "";
+    const fragment = document.createDocumentFragment();
+    const daysInMonth = new Date(state.anio, state.mes + 1, 0).getDate();
+    
+    state.filteredPersonal.forEach(p => {
+      let tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="sticky-col col-contrato pos-1">${p.contrato}</td>
+        <td class="sticky-col col-registro pos-2">${p.registro}</td>
+        <td class="sticky-col col-nombre pos-3" title="${p.nombre}">${p.nombre}</td>
+        <td class="sticky-col col-puesto pos-4" title="${p.puesto}">${p.puesto}</td>`;
+      
+      let domFestCounter = 0;
+      let countedDays = new Set(); 
+
+      for (let d = 1; d <= daysInMonth; d++) {
+        let td = document.createElement('td');
+        td.className = 'day-cell';
+        
+        let dateObj = new Date(state.anio, state.mes, d);
+        let fechaStr = `${state.anio}-${String(state.mes + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        let isSpecialDay = isSundayOrHoliday(dateObj);
+        
+        if (isSpecialDay) td.classList.add('is-holiday');
+        
+        let dailyNovs = state.novedades.filter(n => String(n.registro) === String(p.registro) && n.fecha === fechaStr);
+        
+        if (dailyNovs.length > 0) {
+            let container = document.createElement('div');
+            container.className = 'day-cell-content';
+            const atajoMatchName = detectAtajoMatch(dailyNovs);
+
+            dailyNovs.forEach(nov => {
+                if (isSpecialDay && nov.tipo === 'NOMINA' && !countedDays.has(fechaStr)) {
+                    domFestCounter++;
+                    countedDays.add(fechaStr);
+                }
+            });
+
+            if (atajoMatchName) {
+                let el = document.createElement('div');
+                el.className = 'marker';
+                el.textContent = atajoMatchName;
+                el.style.backgroundColor = "#F54927"; 
+                el.style.color = "white";
+                el.style.fontWeight = "bold";
+                el.style.borderLeft = "3px solid #A6340A";
+                el.style.fontSize = "0.7rem";
+                el.title = atajoMatchName;
+                container.appendChild(el);
+            } else {
+                dailyNovs.forEach(nov => {
+                    let el = document.createElement('div');
+                    el.className = 'marker';
+                    let rawConcepto = nov.concepto || ""; 
+                    let cLower = String(rawConcepto).toLowerCase(); 
+
+                    if (nov.tipo === 'NOMINA') {
+                        el.classList.add('mk-nomina');
+                        el.textContent = nov.valor;
+                    } else if (cLower.includes('permiso')) {
+                        if (cLower.includes('pago')) { 
+                            el.classList.add('mk-pago'); 
+                            el.textContent = "PAG"; 
+                        } else { 
+                            el.classList.add('mk-permiso'); 
+                            el.textContent = "PER"; 
+                        }
+                    } else {
+                        el.classList.add('mk-otro');
+                        el.style.backgroundColor = getColorForConcept(rawConcepto);
+                        el.textContent = rawConcepto ? String(rawConcepto).substring(0, 3).toUpperCase() : "???";
+                    }
+                    container.appendChild(el);
+                });
+            }
+            td.appendChild(container);
+            td.title = dailyNovs.map(n => `${n.concepto || 'S/N'} (${n.valor})`).join('\n');
+        }
+        td.onclick = () => openModal(p, fechaStr, dailyNovs);
+        tr.appendChild(td);
+      }
+
+      let tdDom = document.createElement('td');
+      tdDom.textContent = domFestCounter > 0 ? domFestCounter : "-";
+      tdDom.style.fontWeight = "bold"; tr.appendChild(tdDom);
+
+      let saldoP = state.balancesPermisos[p.registro] || 0;
+      let tdBalP = document.createElement('td');
+      tdBalP.textContent = saldoP + "h";
+      tdBalP.className = saldoP > 0 ? "debt-neg" : (saldoP < 0 ? "debt-pos" : "debt-zero");
+      tr.appendChild(tdBalP);
+      
+      let saldoC = state.balancesComp[p.registro] || 0;
+      let tdBalC = document.createElement('td');
+      tdBalC.textContent = saldoC;
+      tdBalC.className = saldoC > 0 ? "debt-pos" : (saldoC < 0 ? "debt-neg" : "debt-zero");
+      tr.appendChild(tdBalC);
+
+      fragment.appendChild(tr);
+    });
+    tbody.appendChild(fragment);
+  }
+
+  function openModal(persona, fechaStr, existingEvents) {
+    const modal = document.getElementById('modal');
+    modal.style.display = 'block';
+    
+    document.getElementById('txtNombre').textContent = persona.nombre.split(' ')[0];
+    document.getElementById('hdnRegistro').value = persona.registro;
+    document.getElementById('txtFecha').textContent = fechaStr;
+    document.getElementById('hdnFecha').value = fechaStr;
+    
+    resetModalForm();
+    state.currentModalEvents = existingEvents || [];
+    renderModalEventList();
+    
+    document.getElementById('secMassUsers').classList.add('hidden');
+    document.getElementById('secExistingEvents').classList.remove('hidden');
+  }
+
+  function renderModalEventList() {
+    const container = document.getElementById('lstExistingEvents');
+    container.innerHTML = "";
+    const btnClean = document.getElementById('btnDeleteAll');
+
+    if (state.currentModalEvents.length === 0) {
+        document.getElementById('secExistingEvents').classList.add('hidden');
+        if(btnClean) btnClean.classList.add('hidden');
+        return;
+    }
+    
+    if(btnClean) btnClean.classList.remove('hidden');
+
+    document.getElementById('secExistingEvents').classList.remove('hidden');
+    state.currentModalEvents.forEach((ev) => {
+        let div = document.createElement('div');
+        div.className = 'event-card';
+        // Indicamos visualmente si es temporal (opcional)
+        if(String(ev.id).startsWith('temp_') || String(ev.batchId).startsWith('temp_')) {
+            div.style.opacity = "0.7";
+            div.title = "Sincronizando...";
+        }
+
+        div.onclick = () => loadEventToEdit(ev, div);
+        let color = "#999";
+        if(ev.tipo === 'NOMINA') color = "var(--secondary-blue)";
+        else if(ev.concepto.toLowerCase().includes('permiso')) color = "#e74c3c";
+        else color = getColorForConcept(ev.concepto);
+
+        div.innerHTML = `
+            <div class="event-card-main">
+                <div class="event-dot" style="background:${color}"></div>
+                <div class="event-info">${ev.concepto}</div>
+            </div>
+            <div class="event-val">${ev.valor}</div>
+        `;
+        container.appendChild(div);
+    });
+  }
+
+  function loadEventToEdit(ev, cardElement) {
+    // PROTECCIÓN DE SEGURIDAD PARA FLUIDEZ
+    // Si el ID es temporal (comienza con temp_), significa que aún se está guardando.
+    // Bloqueamos la edición para evitar conflictos de ID hasta que llegue la confirmación del servidor.
+    if(String(ev.id).startsWith('temp_') || (ev.batchId && String(ev.batchId).startsWith('temp_'))) {
+        showToast("⏳ Sincronizando registro... inténtalo en unos segundos.", "warning");
+        return; 
+    }
+
+    document.querySelectorAll('.event-card').forEach(el => el.classList.remove('is-editing'));
+    if(cardElement) cardElement.classList.add('is-editing');
+    
+    document.getElementById('hdnId').value = ev.id;
+    document.getElementById('hdnBatchId').value = ev.batchId;
+    
+    document.getElementById('btnDelete').classList.remove('hidden');
+    document.getElementById('btnDeleteAll').classList.add('hidden'); 
+    
+    document.getElementById('btnSave').innerText = "ACTUALIZAR";
+    document.getElementById('btnCancelEdit').classList.remove('hidden');
+    
+    const secAtajos = document.getElementById('secAtajos');
+    if(secAtajos) secAtajos.classList.add('hidden');
+
+    selectType(ev.tipo);
+    setTimeout(() => {
+        document.getElementById('selConcepto').value = ev.concepto;
+        document.getElementById('inpValor').value = ev.valor;
+        document.getElementById('inpObs').value = ev.obs || "";
+        updateInputTypeDisplay();
+    }, 50);
+  }
+
+  function openMassModal(fechaStr) {
+      const modal = document.getElementById('modal');
+      modal.style.display = 'block';
+      resetModalForm();
+      document.getElementById('txtNombre').textContent = "MÚLTIPLE SELECCIÓN";
+      document.getElementById('txtFecha').textContent = fechaStr;
+      document.getElementById('hdnFecha').value = fechaStr;
+      document.getElementById('hdnRegistro').value = "MASIVO";
+      document.getElementById('chkMassAll').checked = true;
+      document.getElementById('inpMassFilter').value = "";
+      document.getElementById('secExistingEvents').classList.add('hidden');
+
+      const listContainer = document.getElementById('lstMassUsers');
+      listContainer.innerHTML = "";
+      state.filteredPersonal.forEach(p => {
+          let div = document.createElement('div');
+          div.className = 'user-check-item';
+          div.innerHTML = `<input type="checkbox" value="${p.registro}" checked> <span>${p.nombre}</span>`;
+          listContainer.appendChild(div);
+      });
+      document.getElementById('secMassUsers').classList.remove('hidden');
+  }
+
+  function filterMassList() {
+      const term = document.getElementById('inpMassFilter').value.toLowerCase();
+      const items = document.querySelectorAll('.user-check-item');
+      items.forEach(item => {
+          if(item.innerText.toLowerCase().includes(term)) item.classList.remove('is-filtered-out');
+          else item.classList.add('is-filtered-out');
+      });
+  }
+
+  function toggleMassAll() {
+      const isChecked = document.getElementById('chkMassAll').checked;
+      document.querySelectorAll('.user-check-item:not(.is-filtered-out) input').forEach(chk => chk.checked = isChecked);
+  }
+
+  function selectType(tipo) {
+    document.getElementById('hdnTipoSeleccionado').value = tipo;
+    const btnNom = document.getElementById('btnTypeNomina');
+    const btnOtr = document.getElementById('btnTypeOtro');
+    if(tipo === 'NOMINA') { btnNom.className = 'type-option active-nom'; btnOtr.className = 'type-option'; } 
+    else { btnNom.className = 'type-option'; btnOtr.className = 'type-option active-otr'; }
+    
+    const sel = document.getElementById('selConcepto');
+    sel.innerHTML = "";
+    const filtered = state.conceptos.filter(c => c.tipo === tipo);
+    filtered.forEach(c => {
+      let opt = document.createElement('option');
+      opt.value = c.nombre; opt.text = c.nombre; sel.appendChild(opt);
+    });
+    updateInputTypeDisplay();
+    document.getElementById('step2').classList.remove('hidden');
+  }
+
+  function updateInputTypeDisplay() {
+      const tipo = document.getElementById('hdnTipoSeleccionado').value;
+      const concepto = document.getElementById('selConcepto').value.toLowerCase();
+      const lbl = document.getElementById('lblValor');
+      const inp = document.getElementById('inpValor');
+      const isPermiso = ["permiso", "pago permiso"].includes(concepto);
+
+      if (tipo === 'NOMINA' || isPermiso) {
+          lbl.textContent = "Horas"; inp.placeholder = "Ej: 1.5, 8";
+          if(inp.value == "1" && !document.getElementById('hdnId').value) inp.value = "";
+      } else {
+          lbl.textContent = "Días consecutivos"; inp.placeholder = "Ej: 1, 5";
+          if (!document.getElementById('hdnId').value && inp.value == "") inp.value = 1;
+      }
+  }
+
+  function closeModal() { document.getElementById('modal').style.display = 'none'; }
+  
+  // ==========================================================
+  // LÓGICA DE GUARDADO Y SINCRONIZACIÓN
+  // ==========================================================
+
+  function saveData() {
+    let registrosArray = [];
+    const isMassMode = !document.getElementById('secMassUsers').classList.contains('hidden');
+    
+    if (isMassMode) {
+        const checks = document.querySelectorAll('#lstMassUsers input:checked');
+        if(checks.length === 0) { showToast("Seleccione al menos una persona", "error"); return; }
+        checks.forEach(c => registrosArray.push(c.value));
+    }
+    
+    const atajoName = document.getElementById('selAtajo').value;
+    let payload = []; 
+
+    // CAPTURAMOS LOS IDS ACTUALES POR SI ES UNA EDICIÓN
+    const idAntiguo = document.getElementById('hdnId').value;
+    const batchIdAntiguo = document.getElementById('hdnBatchId').value;
+
+    if (atajoName) {
+        const items = state.groupedAtajos[atajoName];
+        if (items && items.length > 0) {
+            items.forEach((item, index) => {
+                 payload.push({
+                    registro: document.getElementById('hdnRegistro').value,
+                    registros: registrosArray.length > 0 ? registrosArray : null,
+                    fecha: document.getElementById('hdnFecha').value,
+                    tipo: item.tipo || 'NOMINA', 
+                    concepto: item.concepto,
+                    valor: item.valor,
+                    obs: document.getElementById('inpObs').value + " [Atajo: " + atajoName + "]",
+                    turno: state.turno,
+                    idAntiguo: (index === 0) ? idAntiguo : null, 
+                    batchIdAntiguo: (index === 0) ? batchIdAntiguo : null
+                });
+            });
+        }
+    } else {
+        // LÓGICA NORMAL (SIN ATAJO)
+        let valorRaw = document.getElementById('inpValor').value;
+        if(valorRaw.includes('.')) valorRaw = valorRaw.replace('.', ',');
+        
+        if(!document.getElementById('selConcepto').value || !valorRaw) { showToast("Datos incompletos", "error"); return; }
+
+        payload.push({
+            registro: document.getElementById('hdnRegistro').value,
+            registros: registrosArray.length > 0 ? registrosArray : null, 
+            fecha: document.getElementById('hdnFecha').value,
+            tipo: document.getElementById('hdnTipoSeleccionado').value,
+            concepto: document.getElementById('selConcepto').value,
+            valor: valorRaw,
+            obs: document.getElementById('inpObs').value,
+            turno: state.turno,
+            idAntiguo: idAntiguo,
+            batchIdAntiguo: batchIdAntiguo
+        });
+    }
+    
+    if (payload.length === 0) return;
+
+    closeModal();
+    updateStateOptimistically('SAVE', payload);
+    queueOperation({ action: 'SAVE', data: payload });
+    renderBody();
+}
+
+  function confirmDeleteAll() {
+    const txtFecha = document.getElementById('txtFecha').textContent;
+    if(!confirm("⚠️ ¿Eliminar TODAS las novedades del día " + txtFecha + " para este colaborador?")) return;
+    
+    const registro = document.getElementById('hdnRegistro').value;
+    const fecha = document.getElementById('hdnFecha').value;
+    closeModal();
+    
+    updateStateOptimistically('DELETE_DAY', { registro, fecha });
+    queueOperation({ action: 'DELETE_DAY', registro: registro, fecha: fecha });
+    renderBody();
+  }
+
+  function confirmDelete() {
+    if(!confirm("¿Eliminar registro?")) return;
+    const id = document.getElementById('hdnId').value; 
+    const batchId = document.getElementById('hdnBatchId').value;
+    closeModal();
+    
+    updateStateOptimistically('DELETE', { id, batchId });
+    queueOperation({ action: 'DELETE', id: id, batchId: batchId });
+    renderBody();
+  }
+  
+  function queueOperation(op) {
+      op.opId = generateUUID();
+      syncQueue.push(op);
+      showSyncStatus(true); 
+  }
+
+  async function processSyncQueue() {
+      if (isSyncing || syncQueue.length === 0) return;
+      
+      isSyncing = true;
+      const currentBatch = [...syncQueue];
+      syncQueue = []; 
+
+      try {
+          const res = await runGoogleScript('processClientBatch', currentBatch);
+          
+          if (!res.success) {
+              console.error("Batch Error:", res.error);
+              updateSyncStatus("error", "Error. Recargando...");
+              setTimeout(() => loadData(), 1500); 
+          } else {
+              console.log("Batch Sync OK:", res.results.length);
+              if(syncQueue.length === 0) {
+                 // ÉXITO: Cambiamos el mensaje para que el usuario sepa que 
+                 // estamos validando los IDs, pero SIN loader molesto.
+                 updateSyncStatus("success", "Guardado. Confirmando...");
+                 
+                 // LLAMADA SILENCIOSA (loadData2)
+                 // Esto traerá los IDs reales sin bloquear la UI.
+                 await loadData2();
+                 
+                 // Ocultamos el toast cuando loadData2 haya terminado
+                 if (syncToastElement) syncToastElement.style.opacity = '0';
+              }
+          }
+      } catch (e) {
+          console.error(e);
+          updateSyncStatus("error", "Fallo de red. Recargando...");
+          setTimeout(() => loadData(), 1500);
+      } finally {
+          isSyncing = false;
+      }
+  }
+
+  function showSyncStatus(isLoading) {
+      if (!syncToastElement) {
+          syncToastElement = document.createElement('div');
+          syncToastElement.id = 'syncToast';
+          syncToastElement.style.cssText = `
+              position: fixed; bottom: 20px; right: 20px; z-index: 400;
+              background: #333; color: white; padding: 10px 20px; border-radius: 30px;
+              font-size: 0.85rem; display: flex; align-items: center; gap: 10px;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.2); transition: all 0.3s ease;
+          `;
+          document.body.appendChild(syncToastElement);
+      }
+      if (isLoading) {
+          syncToastElement.style.opacity = '1';
+          syncToastElement.style.background = '#333';
+          syncToastElement.innerHTML = `
+             <div class="spinner" style="width:14px; height:14px; border-width:2px; border-top-color:white;"></div>
+             <span>Sincronizando...</span>
+          `;
+      }
+  }
+
+  function updateSyncStatus(type, msg) {
+      if (!syncToastElement) return;
+      if (type === 'success') {
+          syncToastElement.style.background = '#2ecc71'; 
+          syncToastElement.innerHTML = `<i class="material-icons" style="font-size:1.2rem">check</i> <span>${msg}</span>`;
+          // NOTA: Ya no hacemos fadeOut aquí automáticamente si vamos a llamar a loadData2
+          // El fadeOut lo manejamos en processSyncQueue al finalizar loadData2
+      } else if (type === 'error') {
+          syncToastElement.style.background = '#e74c3c'; 
+          syncToastElement.innerHTML = `<i class="material-icons" style="font-size:1.2rem">warning</i> <span>${msg}</span>`;
+      }
+  }
+
+  function updateStateOptimistically(action, data) {
+    const getTempId = () => "temp_" + Math.random().toString(36).substr(2, 9);
+
+    if (action === 'DELETE_DAY') {
+        state.novedades = state.novedades.filter(n => 
+            !(String(n.registro) === String(data.registro) && n.fecha === data.fecha)
+        );
+    } 
+    else if (action === 'DELETE') {
+        if (data.batchId && !data.batchId.startsWith('temp_')) {
+            state.novedades = state.novedades.filter(n => n.batchId !== data.batchId);
+        } else {
+            state.novedades = state.novedades.filter(n => n.id !== data.id);
+        }
+    }
+    else if (action === 'SAVE') {
+        data.forEach(item => {
+            if (item.batchIdAntiguo) {
+                state.novedades = state.novedades.filter(n => n.batchId !== item.batchIdAntiguo);
+            } else if (item.idAntiguo) {
+                state.novedades = state.novedades.filter(n => n.id !== item.idAntiguo);
+            }
+
+            let targets = (item.registros && item.registros.length > 0) ? item.registros : [item.registro];
+            let bId = getTempId(); 
+
+            targets.forEach(reg => {
+                let conceptoLower = String(item.concepto || "").toLowerCase();
+                let baseDate = new Date(item.fecha + "T12:00:00");
+
+                if (conceptoLower.includes("permiso") || item.tipo === 'NOMINA') {
+                    agregarNovedadAlEstado(reg, baseDate, item, bId, item.valor); 
+                } 
+                else {
+                    let diasDeseados = Math.max(1, parseInt(item.valor) || 1);
+                    let diasAgregados = 0;
+                    let salto = 0;
+                    while (diasAgregados < diasDeseados && salto < 60) {
+                        let d = new Date(baseDate);
+                        d.setDate(d.getDate() + salto);
+                        if (conceptoLower.includes("vacaciones")) {
+                            if (!isSundayOrHoliday(d)) {
+                                agregarNovedadAlEstado(reg, d, item, bId, "1");
+                                diasAgregados++;
+                            }
+                        } else {
+                            agregarNovedadAlEstado(reg, d, item, bId, "1");
+                            diasAgregados++;
+                        }
+                        salto++;
+                    }
+                }
+            });
+        });
+    }
+    recalcBalancesLocally();
+  }
+
+  function agregarNovedadAlEstado(reg, fechaObj, item, bId, valorFinal) {
+    let fStr = `${fechaObj.getFullYear()}-${String(fechaObj.getMonth()+1).padStart(2,'0')}-${String(fechaObj.getDate()).padStart(2,'0')}`;
+    state.novedades.push({
+        id: "temp_" + Math.random().toString(36).substr(2, 9),
+        registro: String(reg),
+        tipo: item.tipo,
+        concepto: item.concepto,
+        valor: valorFinal,
+        fecha: fStr,
+        obs: item.obs || "",
+        batchId: bId 
+    });
+  }
+
+  function recalcBalancesLocally() {
+    state.balancesPermisos = {};
+    state.balancesComp = {}; 
+    state.personal.forEach(p => {
+        state.balancesPermisos[p.registro] = 0;
+        state.balancesComp[p.registro] = 0;
+    });
+
+    const fechasEspecialesTrabajadas = {};
+    state.novedades.forEach(n => {
+        const c = String(n.concepto || "").toLowerCase();
+        const v = parseFloat(String(n.valor).replace(',','.')) || 0;
+        const reg = n.registro;
+        const tipo = n.tipo;
+
+        if(c.includes('pago permiso')) state.balancesPermisos[reg] = (state.balancesPermisos[reg] || 0) + v;
+        else if(c === 'permiso') state.balancesPermisos[reg] = (state.balancesPermisos[reg] || 0) - v;
+
+        if (tipo === 'NOMINA') {
+            let fechaParts = n.fecha.split('-');
+            let fechaObj = new Date(fechaParts[0], fechaParts[1] - 1, fechaParts[2], 12, 0, 0);
+            if (isSundayOrHoliday(fechaObj)) {
+                if (!fechasEspecialesTrabajadas[reg]) fechasEspecialesTrabajadas[reg] = new Set();
+                fechasEspecialesTrabajadas[reg].add(n.fecha);
+            }
+        }
+        if (c.includes('compensatorio')) {
+             let diasComp = (v >= 1 ? v : 1);
+             state.balancesComp[reg] = (state.balancesComp[reg] || 0) - diasComp;
+        }
+    });
+
+    state.personal.forEach(p => {
+        const setFechas = fechasEspecialesTrabajadas[p.registro];
+        const conteoDiasUnicos = setFechas ? setFechas.size : 0;
+        let ganados = 0;
+        if (conteoDiasUnicos >= 3) ganados = (conteoDiasUnicos - 2); 
+        state.balancesComp[p.registro] = (state.balancesComp[p.registro] || 0) + ganados;
+    });
+  }
+
+  function generateUUID() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+  }
+
+  function showToast(msg, type='success') {
+      const container = document.getElementById('toastContainer');
+      const div = document.createElement('div');
+      div.className = `toast ${type}`;
+      div.innerHTML = type === 'success' ? `<i class="material-icons">check_circle</i> ${msg}` : `<i class="material-icons">error</i> ${msg}`;
+      container.appendChild(div);
+      setTimeout(() => {
+          div.style.animation = "fadeOut 0.3s forwards";
+          setTimeout(() => div.remove(), 300);
+      }, 3000);
+  }
+
+function requestReport() {
+  if (!state.turno) { showToast("Seleccione un TURNO primero", "error"); return; }
+  const modal = document.getElementById('modalReport');
+  document.getElementById('viewRepInput').classList.remove('hidden');
+  document.getElementById('viewRepSuccess').classList.add('hidden');
+  document.getElementById('footerRep').classList.remove('hidden');
+  document.getElementById('footerRepClose').classList.add('hidden');
+  const today = new Date();
+  document.getElementById('inpRepSemana').value = getWeekNumber(today);
+  document.getElementById('inpRepFecha').valueAsDate = today;
+  modal.style.display = 'block';
+}
+
+function closeReportModal() {
+  document.getElementById('modalReport').style.display = 'none';
+}
+
+async function generateReportAction() {
+  const semana = document.getElementById('inpRepSemana').value;
+  const fechaLiq = document.getElementById('inpRepFecha').value;
+  const btnGen = document.querySelector('#footerRep .btn-save');
+  const btnCancel = document.querySelector('#footerRep .btn-cancel');
+  const originalText = btnGen.innerText;
+  
+  if (!semana || !fechaLiq) { alert("Complete campos."); return; }
+
+  btnGen.disabled = true; btnCancel.disabled = true; btnGen.innerText = "GENERANDO..."; 
+  showLoader(true); 
+  
+  try {
+    const result = await runGoogleScript('generarReporteSemana', semana, state.anio, state.turno, fechaLiq);
+    showLoader(false);
+    
+    if (result.success) {
+      document.getElementById('viewRepInput').classList.add('hidden');
+      document.getElementById('footerRep').classList.add('hidden');
+      document.getElementById('viewRepSuccess').classList.remove('hidden');
+      document.getElementById('footerRepClose').classList.remove('hidden');
+      document.getElementById('txtRepFilename').innerText = result.filename;
+      document.getElementById('btnRepDownload').href = result.url;
+    } else {
+      showToast(result.error, "error");
+    }
+  } catch (e) {
+    showLoader(false); handleError(e);
+  } finally {
+    btnGen.disabled = false; btnCancel.disabled = false; btnGen.innerText = originalText;
+  }
+}
+
+  function handleError(err) { showLoader(false); showToast("Error: " + err, "error"); }
+  function showLoader(show) { const l = document.getElementById('loader'); if(show) l.classList.remove('hidden'); else l.classList.add('hidden'); }
+</script>
