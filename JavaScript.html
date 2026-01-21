@@ -98,6 +98,7 @@
     
     try {
         const res = await runGoogleScript('getInitialData', state.turno, state.mes, state.anio);
+        checkPendingNovedades();
         processResponse(res);
     } catch (e) { handleError(e); }
   }
@@ -111,11 +112,10 @@
     
     try {
         const res = await runGoogleScript('getInitialData', state.turno, state.mes, state.anio);
-        // Procesamos la respuesta igual, esto actualizará los IDs temporales por reales
+        checkPendingNovedades();
         processResponse(res);
     } catch (e) { 
         console.error("Error en carga silenciosa", e);
-        // Si falla la carga silenciosa, no interrumpimos al usuario agresivamente
         updateSyncStatus("error", "Error de conexión en fondo");
     }
   }
@@ -1087,4 +1087,179 @@ async function generateReportAction() {
 
   function handleError(err) { showLoader(false); showToast("Error: " + err, "error"); }
   function showLoader(show) { const l = document.getElementById('loader'); if(show) l.classList.remove('hidden'); else l.classList.add('hidden'); }
+
+// --- LOGICA DE AUTORIZACIONES ---
+
+let pendingList = [];
+
+function checkPendingNovedades() {
+    // 1. LIMPIEZA INMEDIATA (Soluciona el error visual al cambiar de turno)
+    pendingList = []; 
+    const badge = document.getElementById('badgeAuth');
+    badge.classList.add('hidden'); 
+    badge.innerText = "0";
+    
+    // Si el modal está abierto, limpiarlo también para evitar confusiones
+    document.getElementById('tbodyAuth').innerHTML = ""; 
+
+    const turno = document.getElementById('selTurno').value;
+    if(!turno) return;
+    
+    // 2. Pedir nuevos datos
+    console.log("Buscando novedades para turno: " + turno);
+    google.script.run
+      .withSuccessHandler(renderBadge)
+      .getPendingNovedades(turno);
+  }
+
+function renderBadge(list) {
+  pendingList = list || [];
+  const badge = document.getElementById('badgeAuth');
+  if(pendingList.length > 0) {
+    badge.innerText = pendingList.length;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function openAuthModal() {
+  if(pendingList.length === 0) {
+     showToast("No hay novedades pendientes para este turno.", "normal");
+     return;
+  }
+  renderAuthTable();
+  document.getElementById('modalAuth').style.display = 'flex';
+}
+
+function renderAuthTable() {
+  const tbody = document.getElementById('tbodyAuth');
+  tbody.innerHTML = "";
+  
+  pendingList.forEach((item, index) => {
+    let row = document.createElement('tr');
+    row.style.borderBottom = "1px solid #eee";
+    
+    // Formatear valor si es 1
+    let valDisplay = item.valor;
+    
+    row.innerHTML = `
+      <td style="padding:8px;">${item.registro}</td>
+      <td style="padding:8px;">${item.fecha}</td>
+      <td style="padding:8px;">
+          <div style="font-weight:bold">${item.concepto}</div>
+          <div style="font-size:0.7rem; color:#888;">${item.obs || ""}</div>
+      </td>
+      <td style="padding:8px;">${valDisplay}</td>
+      <td style="padding:8px; text-align:center;">
+         <div style="display:flex; gap:5px; justify-content:center;">
+            <label style="cursor:pointer; background:#e8f5e9; padding:4px 8px; border-radius:4px; border:1px solid #c8e6c9;">
+               <input type="radio" name="auth_${index}" value="APPROVE"> <span style="color:green">✔</span>
+            </label>
+            <label style="cursor:pointer; background:#ffebee; padding:4px 8px; border-radius:4px; border:1px solid #ffcdd2;">
+               <input type="radio" name="auth_${index}" value="REJECT"> <span style="color:red">✘</span>
+            </label>
+         </div>
+      </td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function markAllAuth(action) {
+  pendingList.forEach((_, index) => {
+     let radios = document.getElementsByName(`auth_${index}`);
+     for(let r of radios) {
+       if(r.value === action) r.checked = true;
+     }
+  });
+}
+
+function submitAuth() {
+  let decisions = [];
+  
+  pendingList.forEach((item, index) => {
+    let radios = document.getElementsByName(`auth_${index}`);
+    let selected = null;
+    for(let r of radios) { if(r.checked) selected = r.value; }
+    
+    if(selected) {
+      decisions.push({ id: item.id, action: selected });
+    }
+  });
+
+  if(decisions.length === 0) {
+    showToast("Selecciona Aprobar (✔) o Rechazar (✘) al menos para uno.", "error");
+    return;
+  }
+
+  showLoader(true);
+  google.script.run
+    .withSuccessHandler((res) => {     
+       if(res.success) {
+         showLoader(false);
+         showToast("Autorizaciones procesadas correctamente.");
+         document.getElementById('modalAuth').style.display = 'none';
+         loadData2();
+       } else {
+         showToast("Error: " + res.error, "error");
+       }
+    })
+    .withFailureHandler(err => {
+      showLoader(false);
+       showToast("Error de red", "error");
+    })
+    .processAuthorizationBatch(decisions);
+}
+
+// --- EXPORTAR A SHEETS ---
+
+function exportToSheet() {
+  const turno = document.getElementById('selTurno').value || "Global";
+  
+  // 1. Preparar Datos (Usando la lógica robusta de detección)
+  const exportData = state.filteredPersonal.map(p => {
+    let reg, nombre, puesto;
+    
+    if (Array.isArray(p)) {
+        reg = p[1];
+        nombre = p[3];
+        puesto = p[5];
+    } else {
+        // Fallback por si son objetos
+        reg = p.registro || p[1]; 
+        nombre = p.nombre || p[3];
+        puesto = p.puesto || p[5];
+    }
+    
+    // Convertir a string para buscar en el mapa de saldos
+    const regKey = String(reg);
+    const saldoComp = state.balancesComp[regKey] || 0;
+    const saldoPerm = state.balancesPermisos[regKey] || 0;
+    
+    return [reg, nombre, puesto, saldoComp, saldoPerm];
+  });
+
+  if(exportData.length === 0) {
+     showToast("No hay datos visibles para exportar", "error");
+     return;
+  }
+
+  // 2. Llamar al Backend
+  showLoader(true);
+  
+  google.script.run
+    .withSuccessHandler((res) => {
+       showLoader(false);
+       document.getElementById('exportSheetName').innerText = res.name;
+       document.getElementById('exportSheetLink').href = res.url;
+       document.getElementById('modalExportSuccess').style.display = 'flex';
+    })
+    .withFailureHandler(err => {
+       hideLoader();
+       showToast("Error exportando: " + err.message, "error");
+    })
+    .generateBalanceSheet(turno, exportData);
+}
+
 </script>

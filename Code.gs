@@ -1,8 +1,3 @@
-/**
- * GESTIÓN DE NOVEDADES - BACKEND CORREGIDO
- * FIX: Solución definitiva a duplicidad en Edición y Borrado
- */
-
 function doGet() {
   return HtmlService.createTemplateFromFile('Index')
       .evaluate()
@@ -565,3 +560,158 @@ function FormatoFechaHoraHelper() {
   const pad = (n) => String(n).padStart(2, '0');
   return `${ahora.getFullYear()}${pad(ahora.getMonth() + 1)}${pad(ahora.getDate())}_${pad(ahora.getHours())}${pad(ahora.getMinutes())}`;
 }
+
+// --- MÓDULO DE AUTORIZACIONES (HISTORICO2) ---
+
+const SHEET_PENDING = "Historico2";
+
+function getPendingNovedades(turnoFiltro) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. Obtener Mapa de Turnos (Registro -> Turno) desde BD
+  const sheetBD = ss.getSheetByName(SHEET_BD);
+  const dataBD = sheetBD.getDataRange().getValues();
+  dataBD.shift();
+  
+  let mapTurnos = {};
+  dataBD.forEach(r => {
+    mapTurnos[String(r[COL_BD_REGISTRO])] = String(r[COL_BD_TURNO]); // Mapear Registro a Turno
+  });
+
+  // 2. Leer Pendientes
+  const sheetPend = ss.getSheetByName(SHEET_PENDING);
+  if (!sheetPend || sheetPend.getLastRow() <= 1) return [];
+  
+  const dataPend = sheetPend.getDataRange().getValues();
+  dataPend.shift(); // Quitar headers
+  
+  // 3. Filtrar por Turno
+  let pendientes = [];
+  dataPend.forEach(r => {
+    let reg = String(r[COL_HIST_REGISTRO]);
+    let turnoPersonal = mapTurnos[reg];
+    let obs = String(r[COL_HIST_OBS] || ""); // Obtener observación actual
+    
+    // CONDICIÓN MEJORADA:
+    // 1. Coincide el turno
+    // 2. Y NO contiene la palabra "RECHAZADO" (ignoramos mayúsculas/minúsculas por seguridad)
+    if (turnoPersonal === String(turnoFiltro) && !obs.toUpperCase().includes("RECHAZADO")) {
+        pendientes.push({
+          id: r[COL_HIST_ID],
+          // ... resto de propiedades igual ...
+          registro: reg,
+          tipo: r[COL_HIST_TIPO],
+          concepto: r[COL_HIST_CONCEPTO],
+          valor: r[COL_HIST_VALOR],
+          fecha: (r[COL_HIST_FECHA] instanceof Date) ? Utilities.formatDate(r[COL_HIST_FECHA], Session.getScriptTimeZone(), "yyyy-MM-dd") : r[COL_HIST_FECHA],
+          obs: r[COL_HIST_OBS],
+          batchId: r[COL_HIST_BATCH]
+        });
+    }
+  });
+  
+  return pendientes;
+}
+
+function processAuthorizationBatch(decisions) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheetPend = ss.getSheetByName(SHEET_PENDING);
+    const sheetHist = ss.getSheetByName(SHEET_HIST);
+    
+    // Leer datos actuales para encontrar índices
+    const dataPend = sheetPend.getDataRange().getValues();
+    let idMap = new Map();
+    // i=1 saltando header. row index = i+1
+    for(let i=1; i<dataPend.length; i++) {
+       idMap.set(String(dataPend[i][COL_HIST_ID]), i + 1);
+    }
+    
+    let rowsToDelete = [];
+    let rowsToMove = [];
+    let rowsToUpdate = []; // Para rechazos (si decidimos marcar en lugar de borrar)
+
+    decisions.forEach(d => {
+      if(!idMap.has(d.id)) return;
+      let rowIndex = idMap.get(d.id);
+      let rowValues = dataPend[rowIndex - 1]; // array index
+      
+      if(d.action === 'APPROVE') {
+         // Copiar tal cual a Historico
+         rowsToMove.push(rowValues);
+         rowsToDelete.push(rowIndex);
+      } else if (d.action === 'REJECT') {
+         // Marcar como rechazado en Historico2
+         let currentObs = String(rowValues[COL_HIST_OBS]);
+         let newObs = "RECHAZADO: " + currentObs;
+         rowsToUpdate.push({rowIndex: rowIndex, colIndex: COL_HIST_OBS + 1, value: newObs});
+         // NO lo agregamos a rowsToDelete para que quede evidencia en Historico2
+      }
+    });
+
+    // 1. Mover a Historico (Append)
+    if(rowsToMove.length > 0) {
+      sheetHist.getRange(sheetHist.getLastRow() + 1, 1, rowsToMove.length, rowsToMove[0].length).setValues(rowsToMove);
+    }
+
+    // 2. Actualizar Rechazados (Uno a uno, son pocos)
+    rowsToUpdate.forEach(u => {
+      sheetPend.getRange(u.rowIndex, u.colIndex).setValue(u.value);
+    });
+
+    // 3. Borrar Aprobados de Historico2 (Orden descendente crítico)
+    rowsToDelete.sort((a, b) => b - a);
+    rowsToDelete.forEach(idx => sheetPend.deleteRow(idx));
+
+    return { success: true };
+
+  } catch(e) {
+    return { success: false, error: e.toString() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- GENERACIÓN DE REPORTE EN SHEETS ---
+
+function generateBalanceSheet(turno, exportData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // Limpiamos el nombre del turno para que sea válido como nombre de hoja
+  const cleanTurno = turno.toString().replace(/[^a-zA-Z0-9]/g, "_"); 
+  const sheetName = "Reporte_" + cleanTurno;
+  
+  let sheet = ss.getSheetByName(sheetName);
+  
+  // Si no existe, la creamos. Si existe, borramos su contenido antiguo.
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  } else {
+    sheet.clear(); 
+  }
+  
+  // 1. Poner Encabezados
+  const headers = ["Registro", "Nombre", "Puesto", "Saldo Comp.", "Saldo Perm."];
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange.setValues([headers]);
+  
+  // Estilo de encabezado (Azul y Negrita)
+  headerRange.setFontWeight("bold")
+             .setBackground("#2980b9")
+             .setFontColor("white");
+             
+  // 2. Volcar Datos (si hay)
+  if (exportData && exportData.length > 0) {
+    sheet.getRange(2, 1, exportData.length, exportData[0].length).setValues(exportData);
+  }
+  
+  // 3. Ajustar anchos de columna automáticamente
+  sheet.autoResizeColumns(1, 5);
+
+  // Retornar URL directa a esa hoja (GID)
+  return { 
+    url: ss.getUrl() + "#gid=" + sheet.getSheetId(),
+    name: sheetName
+  };
+} 

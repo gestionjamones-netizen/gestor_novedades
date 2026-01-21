@@ -190,4 +190,60 @@ button:disabled {
 }
   @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
   @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+
+  /* --- FIX: COLUMNAS Y ENCABEZADOS FIJOS --- */
+  
+  /* 1. Definición de Anchos Fijos (Evita que se compriman) */
+  .col-contrato { width: 80px;  min-width: 80px;  max-width: 80px; }
+  .col-registro { width: 70px;  min-width: 70px;  max-width: 70px; }
+  .col-nombre   { width: 260px; min-width: 260px; max-width: 260px; } /* Ancho generoso para nombres */
+  .col-puesto   { width: 150px; min-width: 150px; max-width: 150px; }
+
+  /* 2. Lógica Sticky (El ancla) */
+  .sticky-col {
+    position: sticky !important;
+    left: 0; /* Se ajustará con las clases pos-X */
+    z-index: 30; /* Nivel base para columnas de datos fijas */
+    background-color: #fff; /* Fondo sólido para que no se trasluzca el texto al hacer scroll */
+    box-shadow: 2px 0 5px rgba(0,0,0,0.05); /* Sutil sombra divisoria */
+  }
+
+  /* 3. Coordenadas Exactas (La matemática del apilamiento horizontal) */
+  .pos-1 { left: 0 !important; }
+  .pos-2 { left: 80px !important; }  /* Ancho de Contrato */
+  .pos-3 { left: 150px !important; } /* 80 + 70 */
+  .pos-4 { left: 410px !important; } /* 80 + 70 + 260 */
+
+  /* Borde visual para separar lo fijo del resto de la tabla */
+  .pos-4 { border-right: 2px solid #dce1e6 !important; }
+
+  /* 4. GUERRA DE Z-INDEX (Corrección de superposición) */
+  
+  /* Los encabezados de días (fila 2) y filtros (fila 3) deben estar altos */
+  thead tr th { z-index: 20; }
+  
+  /* PERO las columnas fijas (la intersección esquina superior izq) deben ser SUPREMOS */
+  /* Esto evita que los días "tapen" los nombres al scrollear a la derecha */
+  thead tr th.sticky-col {
+    z-index: 50 !important; 
+    background-color: #f1f3f5; /* Mismo gris que el header para continuidad visual */
+  }
+
+  /* Corrección específica para el cuadro de "Filtros" en columnas fijas */
+  thead tr:nth-child(3) th.sticky-col {
+    z-index: 50 !important;
+    background-color: #f8f9fa;
+  }
+  
+  /* Corrección para el bloque de "Semanas" (Esquina superior absoluta) */
+  thead tr.tr-weeks th.sticky-col {
+    z-index: 60 !important; /* El rey de la colina */
+    background-color: #eaedf1;
+  }
+
+  /* Ajuste para que las celdas de datos (blancas) no tapen cosas indebidas pero tapen el scroll */
+  tbody td.sticky-col {
+    z-index: 30;
+    background-color: #fff;
+  }
 </style>
